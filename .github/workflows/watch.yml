@@ -1,0 +1,40 @@
+name: OPEN LAB 空位監控
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 每 10 分鐘（GitHub 排程常會延遲幾分鐘）
+  workflow_dispatch:          # 可在 Actions 頁面手動執行
+
+concurrency:
+  group: openlab-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 讀取上次結果
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: 查詢空位
+        run: python watcher.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+      - name: 儲存這次結果
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
