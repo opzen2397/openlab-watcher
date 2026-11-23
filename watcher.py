@@ -23,11 +23,17 @@ from zoneinfo import ZoneInfo
 # 新增空間：在預約頁按 F12 → Network，點該空間後找 timezone_media.jsp，
 # 從網址複製 roomSysId 和 location。
 SPACES = [
-    {
-        "name": "星際直播攝影棚",
-        "roomSysId": "20241008171426298-8830dc09-cacb-47d6-841d-3e5227040395",
-        "location": "214",
-    },
+    # name 會顯示在通知標題
+    {"name": "星際直播攝影棚", "location": "214",
+     "roomSysId": "20241008171426298-8830dc09-cacb-47d6-841d-3e5227040395"},
+    {"name": "音樂創作室", "location": "216",
+     "roomSysId": "20241008172103797-873676a6-5faf-45e0-a111-50946e8a664f"},
+    {"name": "討論室 1", "location": "1",
+     "roomSysId": "20241008171720718-967bffe2-3f75-4e66-a3b6-8edae69ec559"},
+    {"name": "討論室 2", "location": "1",
+     "roomSysId": "20241008171746079-9db1019f-655a-4e0f-84d8-110044d3d0cb"},
+    {"name": "討論室 3", "location": "1",
+     "roomSysId": "20241008171915527-963dc245-30d3-4bca-a0c3-a59d067ab3b0"},
 ]
 
 DAYS_AHEAD = 7          # 線上預約開放使用前 7 日
@@ -82,41 +88,58 @@ def fetch_slots(space: dict, day: date) -> list[tuple[str, bool, str]]:
     return parse_slots(html)
 
 
-def load_state() -> set[str]:
+def load_state() -> tuple[set[str], set[str]]:
+    """回傳 (上次可預約的時段, 上次有查過的 空間|日期)。"""
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
+            data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+        return set(), set()
+    if isinstance(data, list):  # 舊版格式
+        return set(data), set()
+    return set(data.get("available", [])), set(data.get("checked", []))
 
 
-def save_state(keys: set[str]) -> None:
+def save_state(available: set[str], checked: set[str]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(keys), f, ensure_ascii=False, indent=1)
+        json.dump({"available": sorted(available), "checked": sorted(checked)},
+                  f, ensure_ascii=False, indent=1)
 
 
-def notify(title: str, message: str) -> None:
+def notify(title: str, message: str, tags: list[str]) -> None:
     if not NTFY_TOPIC:
-        print("[未設定 NTFY_TOPIC，只印出不推播]")
-        print(title)
-        print(message)
+        print(f"[未設定 NTFY_TOPIC，只印出不推播]\n== {title} ==\n{message}\n")
         return
     body = json.dumps({
         "topic": NTFY_TOPIC,
         "title": title,
         "message": message,
         "click": BOOKING_PAGE,
-        "tags": ["bell"],
+        "tags": tags,
     }).encode("utf-8")
     req = urllib.request.Request(NTFY_SERVER, data=body,
                                  headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=20).read()
 
 
+def format_by_date(keys: list[str]) -> list[str]:
+    """把同一天的時段合併成一行：11/27（五）09:00-12:00、13:00-16:00"""
+    by_day: dict[str, list[str]] = {}
+    for key in keys:
+        _, iso, tm = key.split("|")
+        by_day.setdefault(iso, []).append(tm)
+    lines = []
+    for iso in sorted(by_day):
+        d = date.fromisoformat(iso)
+        lines.append(f"{d.month}/{d.day}（{WEEKDAY[d.weekday()]}）" + "、".join(sorted(by_day[iso])))
+    return lines
+
+
 def main() -> int:
     today = datetime.now(TZ).date()
-    prev = load_state()
+    prev, prev_checked = load_state()
     current: set[str] = set()
+    checked: set[str] = set()
     ok = fail = boxes_seen = 0
 
     for space in SPACES:
@@ -132,8 +155,11 @@ def main() -> int:
                 fail += 1
                 print(f"[錯誤] {prefix} {e}", file=sys.stderr)
                 current |= {k for k in prev if k.startswith(prefix)}
+                if prefix[:-1] in prev_checked:
+                    checked.add(prefix[:-1])
                 time.sleep(REQUEST_GAP)
                 continue
+            checked.add(prefix[:-1])
             boxes_seen += len(slots)
             for tm, available, cls in slots:
                 if DEBUG:
@@ -142,26 +168,34 @@ def main() -> int:
                     current.add(prefix + tm)
             time.sleep(REQUEST_GAP)
 
-    new = sorted(current - prev)
-    if new:
-        lines, last_space = [], None
-        for key in new:
-            name, iso, tm = key.split("|")
-            d = date.fromisoformat(iso)
-            if name != last_space:
-                lines.append(f"【{name}】")
-                last_space = name
-            lines.append(f"  {d.month}/{d.day}（{WEEKDAY[d.weekday()]}）{tm}")
-        notify(f"OPEN LAB 有 {len(new)} 個時段可預約", "\n".join(lines))
-    print(f"查詢成功 {ok}、失敗 {fail}，目前可預約 {len(current)}，新出現 {len(new)}")
+    new = current - prev
+    first_run = not prev and not prev_checked
+    sent = 0
+    for space in SPACES:  # 每個空間一則通知，依 SPACES 的順序
+        mine = sorted(k for k in new if k.startswith(space["name"] + "|"))
+        if not mine:
+            continue
+        # 這個日期上次沒查過 → 新開放預約；上次查過但不可預約 → 有人取消或空出
+        opened = [k for k in mine if first_run or k.rsplit("|", 1)[0] not in prev_checked]
+        freed = [k for k in mine if k not in opened]
+        parts = []
+        if opened:
+            parts.append("🆕 新開放預約\n" + "\n".join(format_by_date(opened)))
+        if freed:
+            parts.append("🔔 有人取消，空出時段\n" + "\n".join(format_by_date(freed)))
+        tags = ["rotating_light"] if freed else ["calendar"]
+        notify(f"{space['name']}：{len(mine)} 個時段可預約", "\n\n".join(parts), tags)
+        sent += 1
 
-    save_state(current)
+    print(f"查詢成功 {ok}、失敗 {fail}，目前可預約 {len(current)}，"
+          f"新出現 {len(new)}，送出 {sent} 則通知")
+    save_state(current, checked)
 
     if ok == 0:
         print("全部查詢失敗", file=sys.stderr)
         return 1
     if boxes_seen == 0:
-        # 7 天全部查不到任何時段，很可能網站改版或開始要求登入
+        # 全部查不到任何時段，很可能網站改版或開始要求登入
         print("完全沒解析到時段，網站可能改版了", file=sys.stderr)
         return 1
     return 0
