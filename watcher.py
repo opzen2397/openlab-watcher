@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""國圖多媒體創意實驗中心（OPEN LAB）空位監控。
-
-每次執行：查詢 SPACES 裡每個空間「今天起 7 天內」的時段，
-跟上次結果比對，出現新的可預約時段就推播到 ntfy。
-
-- 新日期進入 7 天預約窗口 → 會收到通知（解決「忘記預約」）
-- 有人取消、時段空出來   → 會收到通知（解決「等空位」）
-
-只用 Python 標準函式庫，不需要 pip install。
-"""
 import json
 import os
 import re
@@ -19,11 +8,7 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# ===== 設定 =====
-# 新增空間：在預約頁按 F12 → Network，點該空間後找 timezone_media.jsp，
-# 從網址複製 roomSysId 和 location。
 SPACES = [
-    # name 會顯示在通知標題
     {"name": "星際直播攝影棚", "location": "214",
      "roomSysId": "20241008171426298-8830dc09-cacb-47d6-841d-3e5227040395"},
     {"name": "音樂創作室", "location": "216",
@@ -37,7 +22,7 @@ SPACES = [
 ]
 
 DAYS_AHEAD = 7          # 線上預約開放使用前 7 日
-REQUEST_GAP = 1.0       # 每個請求間隔秒數，別對國圖伺服器太兇
+REQUEST_GAP = 1.0       # 每個請求間隔秒數，別對國圖伺服器太兇ouo
 SKIP_MONDAY = True      # 每週一休館
 
 BASE_URL = "https://spms.ncl.edu.tw/NLT/co/timezone_media.jsp"
@@ -195,7 +180,7 @@ def main() -> int:
         print("全部查詢失敗", file=sys.stderr)
         return 1
     if boxes_seen == 0:
-        # 全部查不到任何時段，很可能網站改版或開始要求登入
+        # 全部查不到任何時段，說不定網站改版或開始要求登入
         print("完全沒解析到時段，網站可能改版了", file=sys.stderr)
         return 1
     return 0
