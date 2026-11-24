@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""國圖多媒體創意實驗中心（OPEN LAB）空位監控。
+
+每次執行：查詢 SPACES 裡每個空間「今天起 7 天內」的時段，
+跟上次結果比對，出現新的可預約時段就推播到 ntfy。
+
+- 新日期進入 7 天預約窗口 → 會收到通知（解決「忘記預約」）
+- 有人取消、時段空出來   → 會收到通知（解決「等空位」）
+
+python watcher.py        一般模式（GitHub 排程每 10 分鐘）
+python watcher.py burst  盯場模式：9:15、13:15、17:15 盯「今天」被預約的時段，
+                         有人 15 分鐘沒報到、時段釋出就立刻通知
+
+只用 Python 標準函式庫，不需要 pip install。
+"""
 import json
 import os
 import re
@@ -8,7 +23,11 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# ===== 設定 =====
+# 新增空間：在預約頁按 F12 → Network，點該空間後找 timezone_media.jsp，
+# 從網址複製 roomSysId 和 location。
 SPACES = [
+    # name 會顯示在通知標題
     {"name": "星際直播攝影棚", "location": "214",
      "roomSysId": "20241008171426298-8830dc09-cacb-47d6-841d-3e5227040395"},
     {"name": "音樂創作室", "location": "216",
@@ -22,8 +41,13 @@ SPACES = [
 ]
 
 DAYS_AHEAD = 7          # 線上預約開放使用前 7 日
-REQUEST_GAP = 1.0       # 每個請求間隔秒數，別對國圖伺服器太兇ouo
+REQUEST_GAP = 1.0       # 每個請求間隔秒數，別對國圖伺服器太兇
 SKIP_MONDAY = True      # 每週一休館
+
+# 盯場模式：時段開始 15 分鐘沒報到視同棄權
+BURST_HOURS = (9, 13, 17)   # 要盯的時段開始時間
+BURST_FAST = (60, 10)       # 15 分整起的前 60 秒，每 10 秒查一次
+BURST_END = (5, 30)         # 之後每 30 秒查一次，盯到 20 分
 
 BASE_URL = "https://spms.ncl.edu.tw/NLT/co/timezone_media.jsp"
 BOOKING_PAGE = "https://spms.ncl.edu.tw/NLT/co/media_discussion.jsp"
@@ -91,7 +115,7 @@ def save_state(available: set[str], checked: set[str]) -> None:
                   f, ensure_ascii=False, indent=1)
 
 
-def notify(title: str, message: str, tags: list[str]) -> None:
+def notify(title: str, message: str, tags: list[str], priority: int = 3) -> None:
     if not NTFY_TOPIC:
         print(f"[未設定 NTFY_TOPIC，只印出不推播]\n== {title} ==\n{message}\n")
         return
@@ -101,6 +125,7 @@ def notify(title: str, message: str, tags: list[str]) -> None:
         "message": message,
         "click": BOOKING_PAGE,
         "tags": tags,
+        "priority": priority,
     }).encode("utf-8")
     req = urllib.request.Request(NTFY_SERVER, data=body,
                                  headers={"Content-Type": "application/json"})
@@ -120,8 +145,26 @@ def format_by_date(keys: list[str]) -> list[str]:
     return lines
 
 
+def in_burst_window(now: datetime) -> bool:
+    if now.weekday() == 0:
+        return False
+    for h in BURST_HOURS:
+        start = now.replace(hour=h, minute=13, second=0, microsecond=0)
+        end = now.replace(hour=h, minute=15 + BURST_END[0], second=30, microsecond=0)
+        if start <= now < end:
+            return True
+    return False
+
+
 def main() -> int:
-    today = datetime.now(TZ).date()
+    now = datetime.now(TZ)
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and in_burst_window(now):
+        # 盯場模式正在跑，這次跳過，也不存檔，避免兩邊結果互相覆蓋造成重複通知
+        print("盯場時段，一般模式跳過這次")
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        return 0
+    today = now.date()
     prev, prev_checked = load_state()
     current: set[str] = set()
     checked: set[str] = set()
@@ -180,11 +223,89 @@ def main() -> int:
         print("全部查詢失敗", file=sys.stderr)
         return 1
     if boxes_seen == 0:
-        # 全部查不到任何時段，說不定網站改版或開始要求登入
+        # 全部查不到任何時段，很可能網站改版或開始要求登入
         print("完全沒解析到時段，網站可能改版了", file=sys.stderr)
         return 1
     return 0
 
 
+def burst_main() -> int:
+    """盯場模式：由 cron-job.org 在 9:14、13:14、17:14 觸發。"""
+    watch_all = os.environ.get("WATCH_ALL") == "true"  # 測試用：盯今天所有被預約的時段
+    now = datetime.now(TZ)
+    today = now.date()
+    if today.weekday() == 0:
+        print("週一休館")
+        return 0
+    if today.weekday() == 6 and now.hour >= 17 and not watch_all:
+        print("週日 17:00 閉館")
+        return 0
+
+    if watch_all:
+        target = now
+        end = now + timedelta(minutes=2)
+    else:
+        target = now.replace(minute=15, second=0, microsecond=0)
+        end = target + timedelta(minutes=BURST_END[0])
+        if now >= end:
+            print(f"觸發太晚（{now:%H:%M:%S}），已超過盯場時間")
+            return 0
+    hour_prefix = f"{target.hour:02d}:"
+
+    # 先記下「目前被預約」而且是這個整點開始的時段
+    watched: dict[str, set[str]] = {}
+    for space in SPACES:
+        try:
+            slots = fetch_slots(space, today)
+        except Exception as e:
+            print(f"[錯誤] {space['name']} {e}", file=sys.stderr)
+            continue
+        booked = {tm for tm, available, _ in slots
+                  if not available and (watch_all or tm.startswith(hour_prefix))}
+        if booked:
+            watched[space["name"]] = booked
+    if not watched:
+        print("這個時段沒有被預約的空間，不用盯")
+        return 0
+    print("盯場：" + "；".join(f"{n} {sorted(t)}" for n, t in watched.items()))
+
+    wait = (target - datetime.now(TZ)).total_seconds()
+    if wait > 0:
+        time.sleep(wait)
+
+    prev, checked = load_state()
+    space_by_name = {s["name"]: s for s in SPACES}
+    d_label = f"{today.month}/{today.day}（{WEEKDAY[today.weekday()]}）"
+    while watched and datetime.now(TZ) < end:
+        t0 = datetime.now(TZ)
+        for name in list(watched):
+            try:
+                slots = fetch_slots(space_by_name[name], today)
+            except Exception as e:
+                print(f"[錯誤] {name} {e}", file=sys.stderr)
+                continue
+            freed = sorted(tm for tm, available, _ in slots
+                           if available and tm in watched[name])
+            if not freed:
+                continue
+            stamp = datetime.now(TZ).strftime("%H:%M:%S")
+            print(f"{stamp} 釋出：{name} {freed}")
+            notify(f"⏱ {name}：有人棄權，時段釋出",
+                   f"{d_label}" + "、".join(freed) + f"\n{stamp} 釋出，快去預約",
+                   ["rotating_light"], priority=5)
+            prev |= {f"{name}|{today.isoformat()}|{tm}" for tm in freed}
+            watched[name] -= set(freed)
+            if not watched[name]:
+                del watched[name]
+        elapsed = (t0 - target).total_seconds()
+        gap = BURST_FAST[1] if elapsed < BURST_FAST[0] else BURST_END[1]
+        time.sleep(max(0.0, gap - (datetime.now(TZ) - t0).total_seconds()))
+
+    if watched:
+        print("盯場結束，沒有釋出：" + "；".join(f"{n} {sorted(t)}" for n, t in watched.items()))
+    save_state(prev, checked)
+    return 0
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(burst_main() if sys.argv[1:] == ["burst"] else main())
