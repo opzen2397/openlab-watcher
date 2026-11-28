@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""國圖多媒體創意實驗中心（OPEN LAB）空位監控。
 
-每次執行：查詢 SPACES 裡每個空間「今天起 7 天內」的時段，
-跟上次結果比對，出現新的可預約時段就推播到 ntfy。
-
-- 新日期進入 7 天預約窗口 → 會收到通知（解決「忘記預約」）
-- 有人取消、時段空出來   → 會收到通知（解決「等空位」）
-
-python watcher.py        一般模式（GitHub 排程每 10 分鐘）
-python watcher.py burst  盯場模式：9:15、13:15、17:15 盯「今天」被預約的時段，
-                         有人 15 分鐘沒報到、時段釋出就立刻通知
-
-只用 Python 標準函式庫，不需要 pip install。
-"""
 import json
 import os
 import re
@@ -23,11 +10,8 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# ===== 設定 =====
-# 新增空間：在預約頁按 F12 → Network，點該空間後找 timezone_media.jsp，
-# 從網址複製 roomSysId 和 location。
+
 SPACES = [
-    # name 會顯示在通知標題
     {"name": "星際直播攝影棚", "location": "214",
      "roomSysId": "20241008171426298-8830dc09-cacb-47d6-841d-3e5227040395"},
     {"name": "音樂創作室", "location": "216",
